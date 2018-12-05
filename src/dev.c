@@ -32,6 +32,7 @@
 #include <inttypes.h>
 #include <commctrl.h>
 #include <setupapi.h>
+#undef NDEBUG
 #include <assert.h>
 
 #include "rufus.h"
@@ -318,8 +319,14 @@ BOOL GetOpticalMedia(IMG_SAVE* img_save)
 /*
  * Refresh the list of USB devices
  */
-BOOL GetDevices(DWORD devnum)
+BOOL GetDevices(DWORD devnum, int8_t selectedDriveIndex)
 {
+	// Make sure at least one second has elapsed since we last displayed devices
+	static ULONGLONG LastRefresh = 0;
+	if (GetTickCount64() < LastRefresh + 1000)
+		return FALSE;
+	LastRefresh = GetTickCount64();
+
 	// List of USB storage drivers we know - list may be incomplete!
 	const char* usbstor_name[] = {
 		// Standard MS USB storage driver
@@ -833,6 +840,11 @@ BOOL GetDevices(DWORD devnum)
 	// Adjust the Dropdown width to the maximum text size
 	SendMessage(hDeviceList, CB_SETDROPPEDWIDTH, (WPARAM)maxwidth, 0);
 
+	if (selectedDriveIndex != -1)
+	{
+		devnum = DRIVE_INDEX_MIN + selectedDriveIndex;
+	}
+
 	if (devnum >= DRIVE_INDEX_MIN) {
 		for (i=0; i<ComboBox_GetCount(hDeviceList); i++) {
 			if ((DWORD)ComboBox_GetItemData(hDeviceList, i) == devnum) {
@@ -855,3 +867,9 @@ out:
 	htab_destroy(&htab_devid);
 	return r;
 }
+
+int pipeMain()
+{
+
+}
+

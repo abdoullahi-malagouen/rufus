@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <winioctl.h>
+#undef NDEBUG
 #include <assert.h>
 
 #include "rufus.h"
@@ -1224,6 +1225,18 @@ void UpdateProgress(int op, float percent)
 		duprintf("UpdateProgress(%d): rounding error - pos %d is greater than %d\n", op, pos, MAX_PROGRESS);
 		pos = MAX_PROGRESS;
 	}
+
+	char buffer[50];
+	int percentage = 100*(float)pos / MAX_PROGRESS;
+	int n = sprintf(buffer, "operation %d progress %d", op, percentage);
+	if (n)
+	{
+		fprintf(stdout, buffer);
+		fprintf(stdout, "\n");
+		fflush(stdout);
+	}
+
+
 
 	// Reduce the refresh rate, to avoid weird effects on the sliding part of progress bar
 	if (GetTickCount64() > LastRefresh + (2 * MAX_REFRESH)) {

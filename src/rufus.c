@@ -35,6 +35,7 @@
 #include <dbt.h>
 #include <io.h>
 #include <getopt.h>
+#undef NDEBUG
 #include <assert.h>
 
 #include "rufus.h"
@@ -49,6 +50,15 @@
 #include "bled/bled.h"
 #include "../res/grub/grub_version.h"
 #include "../res/grub2/grub2_version.h"
+
+
+#define PROCESSING_SUCCESS 0
+#define PROCESSING_CANCEL -2
+#define PROCESSING_ERROR_CONTROL_ACCESS -3
+#define PROCESSING_ERROR_WRITE_FAULT -4
+#define PROCESSING_ERROR_PARTITION_FAULT -5
+#define PROCESSING_ERROR -6
+
 
 static const char* cmdline_hogger = "rufus.com";
 static const char* FileSystemLabel[FS_MAX] = { "FAT", "FAT32", "NTFS", "UDF", "exFAT", "ReFS" };
@@ -65,8 +75,8 @@ static BOOL user_changed_label = FALSE;
 static BOOL app_changed_label = FALSE;
 static BOOL allowed_filesystem[FS_MAX] = { 0 };
 static int64_t last_iso_blocking_status;
-static int selected_pt = -1, selected_fs = FS_UNKNOWN, preselected_fs = FS_UNKNOWN;
-static int image_index = 0;
+static int selected_pt = -1, selected_fs = -1;
+static int image_index;
 static RECT relaunch_rc = { -65536, -65536, 0, 0};
 static UINT uQFChecked = BST_CHECKED, uMBRChecked = BST_UNCHECKED;
 static HANDLE format_thid = NULL, dialog_handle = NULL;
@@ -103,8 +113,7 @@ BOOL iso_op_in_progress = FALSE, format_op_in_progress = FALSE, right_to_left_mo
 BOOL enable_HDDs = FALSE, force_update = FALSE, enable_ntfs_compression = FALSE, no_confirmation_on_cancel = FALSE, lock_drive = TRUE;
 BOOL advanced_mode_device, advanced_mode_format, allow_dual_uefi_bios, detect_fakes, enable_vmdk, force_large_fat32, usb_debug;
 BOOL use_fake_units, preserve_timestamps = FALSE, fast_zeroing = FALSE, app_changed_size = FALSE;
-BOOL zero_drive = FALSE, list_non_usb_removable_drives = FALSE, enable_file_indexing, large_drive = FALSE;
-BOOL write_as_image = FALSE, installed_uefi_ntfs;
+BOOL zero_drive = FALSE, list_non_usb_removable_drives = FALSE, enable_file_indexing, large_drive = FALSE, write_as_image = FALSE;
 uint64_t persistence_size = 0;
 float fScale = 1.0f;
 int dialog_showing = 0, selection_default = BT_IMAGE, windows_to_go_selection = 0, persistence_unit_selection = -1;
@@ -119,6 +128,8 @@ StrArray DriveID, DriveLabel, DriveHub, BlockingProcess, ImageList;
 // Number of steps for each FS for FCC_STRUCTURE_PROGRESS
 const int nb_steps[FS_MAX] = { 5, 5, 12, 1, 10 };
 const char* flash_type[BADLOCKS_PATTERN_TYPES] = { "SLC", "MLC", "TLC" };
+int8_t inputDriveIndex = -1;
+BOOL noGUI = FALSE;
 
 // TODO: Remember to update copyright year in stdlg's AboutCallback() WM_INITDIALOG,
 // localization_data.sh and the .rc when the year changes!
@@ -559,32 +570,23 @@ static void SetFSFromISO(void)
 		fs_mask |= 1<<fs_tmp;
 	}
 
-	if ((preferred_fs == FS_UNKNOWN) && (preselected_fs != FS_UNKNOWN)) {
-		// If the FS requested from the command line is valid use it
-		if (fs_mask & (1 << preselected_fs)) {
-			preferred_fs = preselected_fs;
+	// The presence of a 4GB file forces the use of NTFS as default FS
+	if (img_report.has_4GB_file) {
+		if (fs_mask & (1 << FS_NTFS)) {
+			preferred_fs = FS_NTFS;
 		}
-	}
-
-	if (preferred_fs == FS_UNKNOWN) {
-		// Syslinux and EFI have precedence over bootmgr (unless the user selected BIOS as target type)
-		if ((HAS_SYSLINUX(img_report)) || (HAS_REACTOS(img_report)) || HAS_KOLIBRIOS(img_report) ||
-			(IS_EFI_BOOTABLE(img_report) && (tt == TT_UEFI) && (!windows_to_go))) {
-			if (fs_mask & (1 << FS_FAT32)) {
-				preferred_fs = FS_FAT32;
-			} else if ((fs_mask & (1 << FS_FAT16)) && !HAS_KOLIBRIOS(img_report)) {
-				preferred_fs = FS_FAT16;
-			}
-		} else if ((windows_to_go) || HAS_BOOTMGR(img_report) || HAS_WINPE(img_report)) {
-			if (fs_mask & (1 << FS_NTFS)) {
-				preferred_fs = FS_NTFS;
-			}
+	// Syslinux and EFI have precedence over bootmgr (unless the user selected BIOS as target type)
+	} else if ((HAS_SYSLINUX(img_report)) || (HAS_REACTOS(img_report)) || HAS_KOLIBRIOS(img_report) ||
+		(IS_EFI_BOOTABLE(img_report) && (tt == TT_UEFI) && (!windows_to_go))) {
+		if (fs_mask & (1<<FS_FAT32)) {
+			preferred_fs = FS_FAT32;
+		} else if ((fs_mask & (1<<FS_FAT16)) && !HAS_KOLIBRIOS(img_report)) {
+			preferred_fs = FS_FAT16;
 		}
-	}
-
-	// The presence of a 4GB file forces the use of NTFS as default FS if available
-	if (img_report.has_4GB_file && (fs_mask & (1 << FS_NTFS))) {
-		preferred_fs = FS_NTFS;
+	} else if ((windows_to_go) || HAS_BOOTMGR(img_report) || HAS_WINPE(img_report)) {
+		if (fs_mask & (1<<FS_NTFS)) {
+			preferred_fs = FS_NTFS;
+		}
 	}
 
 	// Try to select the FS
@@ -802,7 +804,7 @@ static BOOL PopulateProperties(void)
 	GetDrivePartitionData(SelectedDrive.DeviceNumber, fs_type, sizeof(fs_type), FALSE);
 	SetPartitionSchemeAndTargetSystem(FALSE);
 	// Attempt to reselect the last file system explicitly set by the user
-	if (!SetFileSystemAndClusterSize((selected_fs == FS_UNKNOWN) ? fs_type : NULL)) {
+	if (!SetFileSystemAndClusterSize((selected_fs == -1) ? fs_type : NULL)) {
 		SetProposedLabel(-1);
 		uprintf("No file system is selectable for this drive\n");
 		return FALSE;
@@ -1008,14 +1010,19 @@ static void DisplayISOProps(void)
 // Insert the image name into the Boot selection dropdown
 static void UpdateImage(void)
 {
-	assert(image_index != 0);
+	int index;
 
-	if (ComboBox_GetItemData(hBootType, image_index) == BT_IMAGE)
-		ComboBox_DeleteString(hBootType, image_index);
-	ComboBox_InsertStringU(hBootType, image_index,
+	for (index = 0; index < ComboBox_GetCount(hBootType); index++) {
+		if (ComboBox_GetItemData(hBootType, index) == BT_IMAGE) {
+			break;
+		}
+	}
+
+	ComboBox_DeleteString(hBootType, index);
+	ComboBox_InsertStringU(hBootType, index, 
 		(image_path == NULL) ? lmprintf(MSG_281, lmprintf(MSG_280)) : short_image_path);
-	ComboBox_SetItemData(hBootType, image_index, BT_IMAGE);
-	IGNORE_RETVAL(ComboBox_SetCurSel(hBootType, image_index));
+	ComboBox_SetItemData(hBootType, index, BT_IMAGE);
+	IGNORE_RETVAL(ComboBox_SetCurSel(hBootType, index));
 	bt = (int)ComboBox_GetItemData(hBootType, ComboBox_GetCurSel(hBootType));
 	SetBootTypeDropdownWidth();
 }
@@ -1034,6 +1041,7 @@ DWORD WINAPI ISOScanThread(LPVOID param)
 	memset(&img_report, 0, sizeof(img_report));
 	img_report.is_iso = (BOOLEAN)ExtractISO(image_path, "", TRUE);
 	img_report.is_bootable_img = (BOOLEAN)IsBootableImage(image_path);
+	BOOL hasError = FALSE;
 
 	if ((FormatStatus == (ERROR_SEVERITY_ERROR | FAC(FACILITY_STORAGE) | ERROR_CANCELLED)) ||
 		(img_report.image_size == 0) || (!img_report.is_iso && !img_report.is_bootable_img)) {
@@ -1046,6 +1054,7 @@ DWORD WINAPI ISOScanThread(LPVOID param)
 		PrintInfoDebug(0, MSG_203);
 		PrintStatus(0, MSG_203);
 		EnableControls(TRUE);
+		hasError = TRUE;
 		goto out;
 	}
 
@@ -1061,6 +1070,7 @@ DWORD WINAPI ISOScanThread(LPVOID param)
 		if (IS_DD_BOOTABLE(img_report) && !IS_BIOS_BOOTABLE(img_report) && !IS_EFI_BOOTABLE(img_report)) {
 			uprintf("This ISOHybrid is not compatible with any of the ISO boot methods we support");
 			img_report.is_iso = FALSE;
+			hasError = TRUE;
 		}
 		selection_default = BT_IMAGE;
 	}
@@ -1068,7 +1078,8 @@ DWORD WINAPI ISOScanThread(LPVOID param)
 		// No boot method that we support
 		PrintInfo(0, MSG_081);
 		safe_free(image_path);
-		MessageBoxExU(hMainDialog, lmprintf(MSG_082), lmprintf(MSG_081), MB_OK | MB_ICONINFORMATION | MB_IS_RTL, selected_langid);
+		hasError = TRUE;
+		//MessageBoxExU(hMainDialog, lmprintf(MSG_082), lmprintf(MSG_081), MB_OK | MB_ICONINFORMATION | MB_IS_RTL, selected_langid);
 		PrintStatus(0, MSG_086);
 		EnableControls(TRUE);
 		SetMBRProps();
@@ -1107,6 +1118,13 @@ DWORD WINAPI ISOScanThread(LPVOID param)
 	// in the Microsoft worlds SUCKS!!!! (we may lose the disabled "Start" button otherwise)
 	RedrawWindow(hMainDialog, NULL, NULL, RDW_ALLCHILDREN | RDW_UPDATENOW);
 	InvalidateRect(hMainDialog, NULL, TRUE);
+
+	static int startAsked = 0;
+	if (noGUI && startAsked == 0 && hasError == FALSE)
+	{
+		PostMessage(hMainDialog, WM_COMMAND, (WPARAM)IDC_START, 0);
+		startAsked = 1;
+	}
 
 out:
 	dont_display_image_name = FALSE;
@@ -1540,7 +1558,7 @@ static void InitDialog(HWND hDlg)
 	SetWindowTextU(hDlg, tmp);
 	// Now that we have a title, we can find the handle of our Dialog
 	dialog_handle = FindWindowA(NULL, tmp);
-	uprintf(APPLICATION_NAME " " APPLICATION_ARCH " v%d.%d.%d%s%s", rufus_version[0], rufus_version[1], rufus_version[2],
+	uprintf(APPLICATION_NAME " version: %d.%d.%d%s%s", rufus_version[0], rufus_version[1], rufus_version[2],
 		IsAlphaOrBeta(), (ini_file != NULL)?"(Portable)":"");
 	for (i=0; i<ARRAYSIZE(resource); i++) {
 		buf = (char*)GetResource(hMainInstance, resource[i], _RT_RCDATA, "ldlinux_sys", &len, TRUE);
@@ -1651,8 +1669,6 @@ static void InitDialog(HWND hDlg)
 		PostMessage(hDlg, WM_COMMAND, IDC_SELECT, 0);
 	}
 	SetBootTypeDropdownWidth();
-
-	CheckDlgButton(hMainDialog, IDC_LIST_USB_HDD, enable_HDDs ? BST_CHECKED : BST_UNCHECKED);
 
 	PrintInfo(0, MSG_210);
 }
@@ -1839,7 +1855,7 @@ static BOOL CheckDriveAccess(DWORD dwTimeOut)
 		message = GetMuiString("shell32.dll", 28701);	// "This drive is in use (...) Do you want to format it anyway?"
 		if (message != NULL) {
 			ComboBox_GetTextU(hDeviceList, title, sizeof(title));
-			proceed = Notification(MSG_WARNING_QUESTION, NULL, NULL, title, message);
+			proceed = Notification(MSG_WARNING_QUESTION, NULL, title, message);
 			free(message);
 		}
 	}
@@ -1884,7 +1900,7 @@ static INT_PTR CALLBACK MainCallback(HWND hDlg, UINT message, WPARAM wParam, LPA
 	case WM_COMMAND:
 #ifdef RUFUS_TEST
 		if (LOWORD(wParam) == IDC_TEST) {
-			DeletePartitions((DWORD)ComboBox_GetItemData(hDeviceList, ComboBox_GetCurSel(hDeviceList)));
+			uprintf("CPU ARCH: %d", GetCpuArch());
 			break;
 		}
 #endif
@@ -2147,7 +2163,7 @@ static INT_PTR CALLBACK MainCallback(HWND hDlg, UINT message, WPARAM wParam, LPA
 			SetPartitionSchemeAndTargetSystem(FALSE);
 			// Try to reselect current FS from the drive for non-bootable
 			tmp[0] = 0;
-			if ((selected_fs == FS_UNKNOWN) && (SelectedDrive.DeviceNumber != 0))
+			if ((selected_fs == -1) && (SelectedDrive.DeviceNumber != 0))
 				GetDrivePartitionData(SelectedDrive.DeviceNumber, tmp, sizeof(tmp), TRUE);
 			SetFileSystemAndClusterSize(tmp);
 			ToggleImageOptions();
@@ -2194,7 +2210,7 @@ static INT_PTR CALLBACK MainCallback(HWND hDlg, UINT message, WPARAM wParam, LPA
 			if ((HIWORD(wParam)) == BN_CLICKED) {
 				enable_HDDs = !enable_HDDs;
 				PrintStatusTimeout(lmprintf(MSG_253), enable_HDDs);
-				GetDevices(0);
+				GetDevices(0, inputDriveIndex);
 			}
 			break;
 		case IDC_START:
@@ -2206,7 +2222,6 @@ static INT_PTR CALLBACK MainCallback(HWND hDlg, UINT message, WPARAM wParam, LPA
 			tt = (int)ComboBox_GetItemData(hTargetSystem, ComboBox_GetCurSel(hTargetSystem));
 			fs = (int)ComboBox_GetItemData(hFileSystem, ComboBox_GetCurSel(hFileSystem));
 			write_as_image = FALSE;
-			installed_uefi_ntfs = FALSE;
 			// Disable all controls except Cancel
 			EnableControls(FALSE);
 			FormatStatus = 0;
@@ -2301,7 +2316,7 @@ static INT_PTR CALLBACK MainCallback(HWND hDlg, UINT message, WPARAM wParam, LPA
 				KillTimer(hMainDialog, TID_REFRESH_TIMER);
 				if (!format_op_in_progress) {
 					queued_hotplug_event = FALSE;
-					GetDevices((DWORD)ComboBox_GetItemData(hDeviceList, ComboBox_GetCurSel(hDeviceList)));
+					GetDevices((DWORD)ComboBox_GetItemData(hDeviceList, ComboBox_GetCurSel(hDeviceList)), inputDriveIndex);
 					user_changed_label = FALSE;
 					EnableControls(TRUE);
 					if (ComboBox_GetCurSel(hDeviceList) < 0) {
@@ -2338,7 +2353,7 @@ static INT_PTR CALLBACK MainCallback(HWND hDlg, UINT message, WPARAM wParam, LPA
 		log_displayed = FALSE;
 		hLogDialog = MyCreateDialog(hMainInstance, IDD_LOG, hDlg, (DLGPROC)LogCallback);
 		InitDialog(hDlg);
-		GetDevices(0);
+		GetDevices(0, inputDriveIndex);
 		EnableControls(TRUE);
 		CheckForUpdates(FALSE);
 		// Register MEDIA_INSERTED/MEDIA_REMOVED notifications for card readers
@@ -2513,7 +2528,7 @@ static INT_PTR CALLBACK MainCallback(HWND hDlg, UINT message, WPARAM wParam, LPA
 		break;
 
 	case UM_NO_UPDATE:
-		Notification(MSG_INFO, NULL, NULL, lmprintf(MSG_243), lmprintf(MSG_247));
+		Notification(MSG_INFO, NULL, lmprintf(MSG_243), lmprintf(MSG_247));
 		// Need to manually set focus back to "Check Now" for tabbing to work
 		SendMessage(hUpdatesDlg, WM_NEXTDLGCTL, (WPARAM)GetDlgItem(hUpdatesDlg, IDC_CHECK_NOW), TRUE);
 		break;
@@ -2529,8 +2544,12 @@ static INT_PTR CALLBACK MainCallback(HWND hDlg, UINT message, WPARAM wParam, LPA
 				if (dur_secs > UDF_FORMAT_WARN) {
 					dur_mins = dur_secs / 60;
 					dur_secs -= dur_mins * 60;
-					MessageBoxExU(hMainDialog, lmprintf(MSG_112, dur_mins, dur_secs), lmprintf(MSG_113),
-						MB_OK | MB_ICONASTERISK | MB_IS_RTL, selected_langid);
+					if (!noGUI)
+					{
+						MessageBoxExU(hMainDialog, lmprintf(MSG_112, dur_mins, dur_secs), lmprintf(MSG_113),
+							MB_OK | MB_ICONASTERISK | MB_IS_RTL, selected_langid);
+					}
+
 				} else {
 					dur_secs = 0;
 					dur_mins = 0;
@@ -2543,12 +2562,17 @@ static INT_PTR CALLBACK MainCallback(HWND hDlg, UINT message, WPARAM wParam, LPA
 					char* iso_image = lmprintf(MSG_036);
 					char* dd_image = lmprintf(MSG_095);
 					char* choices[2] = { lmprintf(MSG_276, iso_image), lmprintf(MSG_277, dd_image) };
-					i = SelectionDialog(lmprintf(MSG_274), lmprintf(MSG_275, iso_image, dd_image, iso_image, dd_image),
-						choices, 2);
-					if (i < 0)	// Cancel
-						goto aborted_start;
-					else if (i == 2)
-						write_as_image = TRUE;
+					if (!noGUI)
+					{
+						i = SelectionDialog(lmprintf(MSG_274), lmprintf(MSG_275, iso_image, dd_image, iso_image, dd_image),
+							choices, 2);
+						if (i < 0)	// Cancel
+							goto aborted_start;
+						else if (i == 2)
+							write_as_image = TRUE;
+					}
+					
+					
 				} else {
 					write_as_image = TRUE;
 				}
@@ -2559,6 +2583,14 @@ static INT_PTR CALLBACK MainCallback(HWND hDlg, UINT message, WPARAM wParam, LPA
 			goto aborted_start;
 
 		GetWindowTextU(hDeviceList, tmp, ARRAYSIZE(tmp));
+		if (noGUI)
+		{
+			fprintf(stdout, "Waiting on user answer to continue");
+			fprintf(stdout, "\n");
+			fflush(stdout);
+		}
+
+
 		if (MessageBoxExU(hMainDialog, lmprintf(MSG_003, tmp),
 			APPLICATION_NAME, MB_OKCANCEL | MB_ICONWARNING | MB_IS_RTL, selected_langid) == IDCANCEL)
 			goto aborted_start;
@@ -2597,6 +2629,10 @@ static INT_PTR CALLBACK MainCallback(HWND hDlg, UINT message, WPARAM wParam, LPA
 		if (queued_hotplug_event)
 			SendMessage(hDlg, UM_MEDIA_CHANGE, 0, 0);
 		EnableWindow(GetDlgItem(hDlg, IDCANCEL), TRUE);
+		if (noGUI)
+		{
+			ExitProcess(-1);
+		}
 		break;
 
 	case UM_FORMAT_COMPLETED:
@@ -2610,7 +2646,7 @@ static INT_PTR CALLBACK MainCallback(HWND hDlg, UINT message, WPARAM wParam, LPA
 		EnableControls(TRUE);
 		if (wParam) {
 			uprintf("\r\n");
-			GetDevices(DeviceNum);
+			GetDevices(DeviceNum, inputDriveIndex);
 		}
 		if (!IS_ERROR(FormatStatus)) {
 			SendMessage(hProgress, PBM_SETPOS, MAX_PROGRESS, 0);
@@ -2618,17 +2654,19 @@ static INT_PTR CALLBACK MainCallback(HWND hDlg, UINT message, WPARAM wParam, LPA
 			PrintInfo(0, MSG_210);
 			MessageBeep(MB_OK);
 			FlashTaskbar(dialog_handle);
-			if (installed_uefi_ntfs && (!ReadSettingBool(SETTING_DISABLE_SECURE_BOOT_NOTICE))) {
-				notification_info more_info;
-				more_info.id = MORE_INFO_URL;
-				more_info.url = SECURE_BOOT_MORE_INFO_URL;
-				Notification(MSG_INFO, SETTING_DISABLE_SECURE_BOOT_NOTICE, &more_info, lmprintf(MSG_128), lmprintf(MSG_129));
+			if (noGUI)
+			{
+				ExitProcess(PROCESSING_SUCCESS);
 			}
 		} else if (SCODE_CODE(FormatStatus) == ERROR_CANCELLED) {
 			SendMessage(hProgress, PBM_SETSTATE, (WPARAM)PBST_PAUSED, 0);
 			SetTaskbarProgressState(TASKBAR_PAUSED);
 			PrintInfo(0, MSG_211);
-			Notification(MSG_INFO, NULL, NULL, lmprintf(MSG_211), lmprintf(MSG_041));
+			Notification(MSG_INFO, NULL, lmprintf(MSG_211), lmprintf(MSG_041));
+			if (noGUI)
+			{
+				ExitProcess(PROCESSING_CANCEL);
+			}
 		} else {
 			SendMessage(hProgress, PBM_SETSTATE, (WPARAM)PBST_ERROR, 0);
 			SetTaskbarProgressState(TASKBAR_ERROR);
@@ -2638,6 +2676,7 @@ static INT_PTR CALLBACK MainCallback(HWND hDlg, UINT message, WPARAM wParam, LPA
 			if (BlockingProcess.Index > 0) {
 				ListDialog(lmprintf(MSG_042), lmprintf(MSG_055), BlockingProcess.String, BlockingProcess.Index);
 			} else {
+				int8_t errorType = PROCESSING_ERROR;
 				if (nWindowsVersion >= WINDOWS_10) {
 					// Try to detect if 'Controlled Folder Access' is enabled on Windows 10 or later. See also:
 					// http://www.winhelponline.com/blog/use-controlled-folder-access-windows-10-windows-defender
@@ -2649,7 +2688,9 @@ static INT_PTR CALLBACK MainCallback(HWND hDlg, UINT message, WPARAM wParam, LPA
 						"Exit (Get-MpPreference).EnableControlledFolderAccess" };
 					switch (SCODE_CODE(FormatStatus)) {
 					case ERROR_PARTITION_FAILURE:
+						errorType = PROCESSING_ERROR_PARTITION_FAULT;
 					case ERROR_WRITE_FAULT:
+						errorType = PROCESSING_ERROR_WRITE_FAULT;
 						// Find if PowerShell is available at its expected location
 						static_sprintf(tmp, "%s\\WindowsPowerShell\\v1.0\\powershell.exe", system_dir);
 						if (PathFileExistsU(tmp)) {
@@ -2667,7 +2708,8 @@ static INT_PTR CALLBACK MainCallback(HWND hDlg, UINT message, WPARAM wParam, LPA
 						break;
 					}
 				}
-				Notification(MSG_ERROR, NULL, NULL, lmprintf(MSG_042), lmprintf(MSG_043, StrError(FormatStatus, FALSE)));
+				Notification(MSG_ERROR, NULL, lmprintf(MSG_042), lmprintf(MSG_043, StrError(FormatStatus, FALSE)));
+				ExitProcess(errorType);
 			}
 		}
 		FormatStatus = 0;
@@ -2683,17 +2725,15 @@ static void PrintUsage(char* appname)
 	char fname[_MAX_FNAME];
 
 	_splitpath(appname, NULL, NULL, fname, NULL);
-	printf("\nUsage: %s [-x] [-g] [-h] [-f FILESYSTEM] [-i PATH] [-l LOCALE] [-w TIMEOUT]\n", fname);
-	printf("  -x, --extra-devs\n");
-	printf("     List extra devices, such as USB HDDs\n");
+	printf("\nUsage: %s [-f] [-g] [-h] [-i PATH] [-l LOCALE] [-w TIMEOUT]\n", fname);
+	printf("  -f, --fixed\n");
+	printf("     Enable the listing of fixed/HDD USB drives\n");
 	printf("  -g, --gui\n");
 	printf("     Start in GUI mode (disable the 'rufus.com' commandline hogger)\n");
 	printf("  -i PATH, --iso=PATH\n");
 	printf("     Select the ISO image pointed by PATH to be used on startup\n");
 	printf("  -l LOCALE, --locale=LOCALE\n");
 	printf("     Select the locale to be used on startup\n");
-	printf("  -f FILESYSTEM, --filesystem=FILESYSTEM\n");
-	printf("     Preselect the file system to be preferred when formatting\n");
 	printf("  -w TIMEOUT, --wait=TIMEOUT\n");
 	printf("     Wait TIMEOUT tens of seconds for the global application mutex to be released.\n");
 	printf("     Used when launching a newer version of " APPLICATION_NAME " from a running application.\n");
@@ -2701,7 +2741,7 @@ static void PrintUsage(char* appname)
 	printf("     This usage guide.\n");
 }
 
-static HANDLE SetHogger(void)
+static HANDLE SetHogger(BOOL attached_console, BOOL disable_hogger)
 {
 	INPUT* input;
 	BYTE* hog_data;
@@ -2709,9 +2749,12 @@ static HANDLE SetHogger(void)
 	HANDLE hogmutex = NULL, hFile = NULL;
 	int i;
 
+	if (!attached_console)
+		return NULL;
+
 	hog_data = GetResource(hMainInstance, MAKEINTRESOURCEA(IDR_XT_HOGGER),
 		_RT_RCDATA, cmdline_hogger, &hog_size, FALSE);
-	if (hog_data != NULL) {
+	if ((hog_data != NULL) && (!disable_hogger)) {
 		// Create our synchronisation mutex
 		hogmutex = CreateMutexA(NULL, TRUE, "Global/Rufus_CmdLine");
 
@@ -2771,14 +2814,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 	HWND hDlg = NULL;
 	HDC hDC;
 	MSG msg;
+
 	struct option long_options[] = {
-		{"extra-devs", no_argument,       NULL, 'x'},
-		{"gui",        no_argument,       NULL, 'g'},
-		{"help",       no_argument,       NULL, 'h'},
-		{"iso",        required_argument, NULL, 'i'},
-		{"locale",     required_argument, NULL, 'l'},
-		{"filesystem", required_argument, NULL, 'f'},
-		{"wait",       required_argument, NULL, 'w'},
+		{"fixed",   no_argument,       NULL, 'f'},
+		{"gui",     no_argument,       NULL, 'g'},
+		{"help",    no_argument,       NULL, 'h'},
+		{"iso",     required_argument, NULL, 'i'},
+		{"locale",  required_argument, NULL, 'l'},
+		{"wait",    required_argument, NULL, 'w'},
 		{0, 0, NULL, 0}
 	};
 
@@ -2810,6 +2853,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
 	uprintf("*** " APPLICATION_NAME " init ***\n");
 
+	// Reattach the console, if we were started from commandline
+	if (AttachConsole(ATTACH_PARENT_PROCESS) != 0) {
+		attached_console = TRUE;
+		IGNORE_RETVAL(freopen("CONIN$", "r", stdin));
+		IGNORE_RETVAL(freopen("CONOUT$", "w", stdout));
+		IGNORE_RETVAL(freopen("CONOUT$", "w", stderr));
+		_flushall();
+	}
+
 	// We have to process the arguments before we acquire the lock and process the locale
 	PF_INIT(__wgetmainargs, Msvcrt);
 	if (pf__wgetmainargs != NULL) {
@@ -2827,6 +2879,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 				// on the commandline then, which the hogger makes more intuitive.
 				if ((strcmp(argv[i], "-g") == 0) || (strcmp(argv[i], "--gui") == 0))
 					disable_hogger = TRUE;
+
 			}
 			// If our application name contains a 'p' (for "portable") create a 'rufus.ini'
 			// NB: argv[0] is populated in the previous loop
@@ -2838,21 +2891,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 				ini_flags[0] = 'a';
 
 			// Now enable the hogger before processing the rest of the arguments
-			if (!disable_hogger) {
-				// Reattach the console, if we were started from commandline
-				if (AttachConsole(ATTACH_PARENT_PROCESS) != 0) {
-					attached_console = TRUE;
-					IGNORE_RETVAL(freopen("CONIN$", "r", stdin));
-					IGNORE_RETVAL(freopen("CONOUT$", "w", stdout));
-					IGNORE_RETVAL(freopen("CONOUT$", "w", stderr));
-					_flushall();
-					hogmutex = SetHogger();
-				}
-			}
+			hogmutex = SetHogger(attached_console, disable_hogger);
 
-			while ((opt = getopt_long(argc, argv, "?xghf:i:w:l:", long_options, &option_index)) != EOF) {
+			while ((opt = getopt_long(argc, argv, "?fghind:w:l:", long_options, &option_index)) != EOF) {
 				switch (opt) {
-				case 'x':
+				case 'd':
+					inputDriveIndex = atoi(optarg);
+					break;
+				case 'n':
+					noGUI = TRUE;
+					break;
+				case 'f':
 					enable_HDDs = TRUE;
 					break;
 				case 'g':
@@ -2876,21 +2925,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 						safe_free(locale_name);
 						locale_name = safe_strdup(optarg);
 					}
-					break;
-				case 'f':
-					if (isdigitU(optarg[0])) {
-						preselected_fs = (int)strtol(optarg, NULL, 0);
-					} else {
-						for (i = 0; i < ARRAYSIZE(FileSystemLabel); i++) {
-							if (safe_stricmp(optarg, FileSystemLabel[i]) == 0) {
-								preselected_fs = i;
-								break;
-							}
-						}
-					}
-					if ((preselected_fs < FS_UNKNOWN) || (preselected_fs >= FS_MAX))
-						preselected_fs = FS_UNKNOWN;
-					selected_fs = preselected_fs;
 					break;
 				case 'w':
 					wait_for_mutex = atoi(optarg);
@@ -3120,7 +3154,23 @@ relaunch:
 	if (!SetFormatPromptHook())
 		uprintf("Warning: Could not set 'Format Disk' prompt auto-close");
 
-	ShowWindow(hDlg, SW_SHOWNORMAL);
+	if (noGUI)
+	{
+		ShowWindow(hDlg, SW_HIDE);
+		if (image_path == NULL)
+		{
+			fprintf(stdout, "No image provided exiting");
+			fprintf(stdout, "\n");
+			fflush(stdout);
+			ExitProcess(-1);
+		}
+	}
+	else
+	{
+		ShowWindow(hDlg, SW_SHOWNORMAL);
+		
+	}
+	
 	UpdateWindow(hDlg);
 
 	// Do our own event processing and process "magic" commands
@@ -3145,7 +3195,7 @@ relaunch:
 			usb_debug = !usb_debug;
 			WriteSettingBool(SETTING_ENABLE_USB_DEBUG, usb_debug);
 			PrintStatusTimeout(lmprintf(MSG_270), usb_debug);
-			GetDevices(0);
+			GetDevices(0, inputDriveIndex);
 			continue;
 		}
 		// Alt-, => Disable physical drive locking
@@ -3194,7 +3244,7 @@ relaunch:
 		if ((msg.message == WM_SYSKEYDOWN) && (msg.wParam == 'F')) {
 			enable_HDDs = !enable_HDDs;
 			PrintStatusTimeout(lmprintf(MSG_253), enable_HDDs);
-			GetDevices(0);
+			GetDevices(0, inputDriveIndex);
 			CheckDlgButton(hMainDialog, IDC_LIST_USB_HDD, enable_HDDs?BST_CHECKED:BST_UNCHECKED);
 			continue;
 		}
@@ -3231,7 +3281,7 @@ relaunch:
 			force_large_fat32 = !force_large_fat32;
 			WriteSettingBool(SETTING_FORCE_LARGE_FAT32_FORMAT, force_large_fat32);
 			PrintStatusTimeout(lmprintf(MSG_254), force_large_fat32);
-			GetDevices(0);
+			GetDevices(0, inputDriveIndex);
 			continue;
 		}
 		// Alt N => Enable NTFS compression
@@ -3266,7 +3316,7 @@ relaunch:
 		if ((msg.message == WM_SYSKEYDOWN) && (msg.wParam == 'S')) {
 			size_check = !size_check;
 			PrintStatusTimeout(lmprintf(MSG_252), size_check);
-			GetDevices(0);
+			GetDevices(0, inputDriveIndex);
 			continue;
 		}
 		// Alt-T => Preserve timestamps when extracting ISO files
@@ -3281,7 +3331,7 @@ relaunch:
 			use_fake_units = !use_fake_units;
 			WriteSettingBool(SETTING_USE_PROPER_SIZE_UNITS, !use_fake_units);
 			PrintStatusTimeout(lmprintf(MSG_263), !use_fake_units);
-			GetDevices(0);
+			GetDevices(0, inputDriveIndex);
 			continue;
 		}
 		// Alt-W => Enable VMWare disk detection
@@ -3289,7 +3339,7 @@ relaunch:
 			enable_vmdk = !enable_vmdk;
 			WriteSettingBool(SETTING_ENABLE_VMDK_DETECTION, enable_vmdk);
 			PrintStatusTimeout(lmprintf(MSG_265), enable_vmdk);
-			GetDevices(0);
+			GetDevices(0, inputDriveIndex);
 			continue;
 		}
 		// Alt-X => Delete the NoDriveTypeAutorun key on exit (useful if the app crashed)
@@ -3342,7 +3392,7 @@ relaunch:
 				(list_non_usb_removable_drives)?"CAUTION: ":"", (list_non_usb_removable_drives)?"enabled":"disabled");
 			if (list_non_usb_removable_drives)
 				uprintf("By using this unofficial cheat mode you forfeit ANY RIGHT to complain if you lose valuable data!");
-			GetDevices(0);
+			GetDevices(0, inputDriveIndex);
 			continue;
 		}
 
@@ -3352,7 +3402,8 @@ relaunch:
 			DispatchMessage(&msg);
 		}
 	}
-	if (relaunch) {
+	if (relaunch)
+	{
 		relaunch = FALSE;
 		reinit_localization();
 		goto relaunch;
@@ -3399,3 +3450,214 @@ out:
 
 	return 0;
 }
+
+#define BUFSIZE 512
+#include <stdio.h> 
+#include <tchar.h>
+#include <strsafe.h>
+
+VOID GetAnswerToRequest(LPTSTR, LPTSTR, LPDWORD);
+VOID GetAnswerToRequest(LPTSTR pchRequest,
+	LPTSTR pchReply,
+	LPDWORD pchBytes)
+	// This routine is a simple function to print the client request to the console
+	// and populate the reply buffer with a default data string. This is where you
+	// would put the actual client request processing code that runs in the context
+	// of an instance thread. Keep in mind the main thread will continue to wait for
+	// and receive other client connections while the instance thread is working.
+{
+	_tprintf(TEXT("Client Request String:\"%s\"\n"), pchRequest);
+
+	// Check the outgoing message to make sure it's not too long for the buffer.
+	if (FAILED(StringCchCopy(pchReply, BUFSIZE, TEXT("default answer from server"))))
+	{
+		*pchBytes = 0;
+		pchReply[0] = 0;
+		printf("StringCchCopy failed, no outgoing message.\n");
+		return;
+	}
+	*pchBytes = (lstrlen(pchReply) + 1) * sizeof(TCHAR);
+}
+
+DWORD WINAPI InstanceThread(LPVOID lpvParam)
+// This routine is a thread processing function to read from and reply to a client
+// via the open pipe connection passed from the main loop. Note this allows
+// the main loop to continue executing, potentially creating more threads of
+// of this procedure to run concurrently, depending on the number of incoming
+// client connections.
+{
+	HANDLE hHeap = GetProcessHeap();
+	TCHAR* pchRequest = (TCHAR*)HeapAlloc(hHeap, 0, BUFSIZE * sizeof(TCHAR));
+	TCHAR* pchReply = (TCHAR*)HeapAlloc(hHeap, 0, BUFSIZE * sizeof(TCHAR));
+
+	DWORD cbBytesRead = 0, cbReplyBytes = 0, cbWritten = 0;
+	BOOL fSuccess = FALSE;
+	HANDLE hPipe = NULL;
+
+	// Do some extra error checking since the app will keep running even if this
+	// thread fails.
+
+	if (lpvParam == NULL)
+	{
+		printf("\nERROR - Pipe Server Failure:\n");
+		printf("   InstanceThread got an unexpected NULL value in lpvParam.\n");
+		printf("   InstanceThread exitting.\n");
+		if (pchReply != NULL) HeapFree(hHeap, 0, pchReply);
+		if (pchRequest != NULL) HeapFree(hHeap, 0, pchRequest);
+		return (DWORD)-1;
+	}
+
+	if (pchRequest == NULL)
+	{
+		printf("\nERROR - Pipe Server Failure:\n");
+		printf("   InstanceThread got an unexpected NULL heap allocation.\n");
+		printf("   InstanceThread exitting.\n");
+		if (pchReply != NULL) HeapFree(hHeap, 0, pchReply);
+		return (DWORD)-1;
+	}
+
+	if (pchReply == NULL)
+	{
+		printf("\nERROR - Pipe Server Failure:\n");
+		printf("   InstanceThread got an unexpected NULL heap allocation.\n");
+		printf("   InstanceThread exitting.\n");
+		if (pchRequest != NULL) HeapFree(hHeap, 0, pchRequest);
+		return (DWORD)-1;
+	}
+
+	// Print verbose messages. In production code, this should be for debugging only.
+	printf("InstanceThread created, receiving and processing messages.\n");
+
+	// The thread's parameter is a handle to a pipe object instance. 
+
+	hPipe = (HANDLE)lpvParam;
+
+	// Loop until done reading
+	while (1)
+	{
+		// Read client requests from the pipe. This simplistic code only allows messages
+		// up to BUFSIZE characters in length.
+		fSuccess = ReadFile(
+			hPipe,        // handle to pipe 
+			pchRequest,    // buffer to receive data 
+			BUFSIZE * sizeof(TCHAR), // size of buffer 
+			&cbBytesRead, // number of bytes read 
+			NULL);        // not overlapped I/O 
+
+		if (!fSuccess || cbBytesRead == 0)
+		{
+			if (GetLastError() == ERROR_BROKEN_PIPE)
+			{
+				_tprintf(TEXT("InstanceThread: client disconnected.\n"), GetLastError());
+			}
+			else
+			{
+				_tprintf(TEXT("InstanceThread ReadFile failed, GLE=%d.\n"), GetLastError());
+			}
+			break;
+		}
+
+		// Process the incoming message.
+		GetAnswerToRequest(pchRequest, pchReply, &cbReplyBytes);
+
+		// Write the reply to the pipe. 
+		fSuccess = WriteFile(
+			hPipe,        // handle to pipe 
+			pchReply,     // buffer to write from 
+			cbReplyBytes, // number of bytes to write 
+			&cbWritten,   // number of bytes written 
+			NULL);        // not overlapped I/O 
+
+		if (!fSuccess || cbReplyBytes != cbWritten)
+		{
+			_tprintf(TEXT("InstanceThread WriteFile failed, GLE=%d.\n"), GetLastError());
+			break;
+		}
+	}
+
+	// Flush the pipe to allow the client to read the pipe's contents 
+	// before disconnecting. Then disconnect the pipe, and close the 
+	// handle to this pipe instance. 
+
+	FlushFileBuffers(hPipe);
+	DisconnectNamedPipe(hPipe);
+	CloseHandle(hPipe);
+
+	HeapFree(hHeap, 0, pchRequest);
+	HeapFree(hHeap, 0, pchReply);
+
+	printf("InstanceThread exitting.\n");
+	return 1;
+}
+
+int CreatePipeServer()
+{
+	BOOL   fConnected = FALSE;
+	DWORD  dwThreadId = 0;
+	HANDLE hPipe = INVALID_HANDLE_VALUE, hThread = NULL;
+	LPTSTR lpszPipename = TEXT("\\\\.\\pipe\\mynamedpipe");
+
+	// The main loop creates an instance of the named pipe and 
+	// then waits for a client to connect to it. When the client 
+	// connects, a thread is created to handle communications 
+	// with that client, and this loop is free to wait for the
+	// next client connect request. It is an infinite loop.
+
+	for (;;)
+	{
+		_tprintf(TEXT("\nPipe Server: Main thread awaiting client connection on %s\n"), lpszPipename);
+		hPipe = CreateNamedPipe(
+			lpszPipename,             // pipe name 
+			PIPE_ACCESS_DUPLEX,       // read/write access 
+			PIPE_TYPE_MESSAGE |       // message type pipe 
+			PIPE_READMODE_MESSAGE |   // message-read mode 
+			PIPE_WAIT,                // blocking mode 
+			PIPE_UNLIMITED_INSTANCES, // max. instances  
+			BUFSIZE,                  // output buffer size 
+			BUFSIZE,                  // input buffer size 
+			0,                        // client time-out 
+			NULL);                    // default security attribute 
+
+		if (hPipe == INVALID_HANDLE_VALUE)
+		{
+			_tprintf(TEXT("CreateNamedPipe failed, GLE=%d.\n"), GetLastError());
+			return -1;
+		}
+
+		// Wait for the client to connect; if it succeeds, 
+		// the function returns a nonzero value. If the function
+		// returns zero, GetLastError returns ERROR_PIPE_CONNECTED. 
+
+		fConnected = ConnectNamedPipe(hPipe, NULL) ?
+			TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
+
+		if (fConnected)
+		{
+			printf("Client connected, creating a processing thread.\n");
+
+			// Create a thread for this client. 
+			hThread = CreateThread(
+				NULL,              // no security attribute 
+				0,                 // default stack size 
+				InstanceThread,    // thread proc
+				(LPVOID)hPipe,    // thread parameter 
+				0,                 // not suspended 
+				&dwThreadId);      // returns thread ID 
+
+			if (hThread == NULL)
+			{
+				_tprintf(TEXT("CreateThread failed, GLE=%d.\n"), GetLastError());
+				return -1;
+			}
+			else CloseHandle(hThread);
+		}
+		else
+			// The client could not connect, so close the pipe. 
+			CloseHandle(hPipe);
+	}
+
+	return 0;
+}
+
+
+

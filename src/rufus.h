@@ -29,22 +29,11 @@
 #pragma once
 
 /* Program options */
-#define RUFUS_LOGGING               // print info to logging facility
+//#define RUFUS_LOGGING               // print info to logging facility
 /* Features not ready for prime time and that may *DESTROY* your data - USE AT YOUR OWN RISKS! */
 //#define RUFUS_TEST
 
 #define APPLICATION_NAME            "Rufus"
-#if defined(_M_AMD64)
-#define APPLICATION_ARCH            "x64"
-#elif defined(_M_IX86)
-#define APPLICATION_ARCH            "x86"
-#elif defined(_M_ARM64)
-#define APPLICATION_ARCH            "Arm64"
-#elif defined(_M_ARM)
-#define APPLICATION_ARCH            "Arm"
-#else
-#define APPLICATION_ARCH            "(Unknown Arch)"
-#endif
 #define COMPANY_NAME                "Akeo Consulting"
 #define STR_NO_LABEL                "NO_LABEL"
 // Yes, there exist characters between these seemingly empty quotes!
@@ -72,7 +61,6 @@
 #define MAX_GPT_PARTITIONS          128
 #define MAX_SECTORS_TO_CLEAR        128			// nb sectors to zap when clearing the MBR/GPT (must be >34)
 #define MBR_UEFI_MARKER             0x49464555	// 'U', 'E', 'F', 'I', as a 32 bit little endian longword
-#define MORE_INFO_URL               0xFFFF
 #define STATUS_MSG_TIMEOUT          3500		// How long should cheat mode messages appear for on the status bar
 #define WRITE_RETRIES               4
 #define WRITE_TIMEOUT               5000		// How long we should wait between write retries
@@ -101,7 +89,6 @@
 #endif
 #define DOWNLOAD_URL                RUFUS_URL "/downloads"
 #define FILES_URL                   RUFUS_URL "/files"
-#define SECURE_BOOT_MORE_INFO_URL   "https://github.com/pbatard/rufus/wiki/FAQ#Why_do_I_need_to_disable_Secure_Boot_to_use_UEFINTFS"
 #define SEVENZIP_URL                "https://www.7-zip.org"
 #define FILES_DIR                   "rufus_files"
 #define IGNORE_RETVAL(expr)         do { (void)(expr); } while(0)
@@ -199,10 +186,7 @@ enum notification_type {
 typedef INT_PTR (CALLBACK *Callback_t)(HWND, UINT, WPARAM, LPARAM);
 typedef struct {
 	WORD id;
-	union {
-		Callback_t callback;
-		char* url;
-	};
+	Callback_t callback;
 } notification_info;	// To provide a "More info..." on notifications
 
 /* Status Bar sections */
@@ -486,7 +470,7 @@ extern INT_PTR CreateAboutBox(void);
 extern BOOL CreateTooltip(HWND hControl, const char* message, int duration);
 extern void DestroyTooltip(HWND hWnd);
 extern void DestroyAllTooltips(void);
-extern BOOL Notification(int type, const char* dont_display_setting, const notification_info* more_info, char* title, char* format, ...);
+extern BOOL Notification(int type, const notification_info* more_info, char* title, char* format, ...);
 extern int SelectionDialog(char* title, char* message, char** choices, int size);
 extern void ListDialog(char* title, char* message, char** items, int size);
 extern SIZE GetTextSize(HWND hCtrl, char* txt);
@@ -506,7 +490,7 @@ extern unsigned char* GetResource(HMODULE module, char* name, char* type, const 
 extern DWORD GetResourceSize(HMODULE module, char* name, char* type, const char* desc);
 extern DWORD RunCommand(const char* cmdline, const char* dir, BOOL log);
 extern BOOL CompareGUID(const GUID *guid1, const GUID *guid2);
-extern BOOL GetDevices(DWORD devnum);
+extern BOOL GetDevices(DWORD devnum, int8_t driveIndex);
 extern BOOL ResetDevice(int index);
 extern BOOL GetOpticalMedia(IMG_SAVE* img_save);
 extern BOOL SetLGP(BOOL bRestore, BOOL* bExistingKey, const char* szPath, const char* szPolicy, DWORD dwValue);
@@ -566,6 +550,8 @@ extern HICON CreateMirroredIcon(HICON hiconOrg);
 DWORD WINAPI FormatThread(void* param);
 DWORD WINAPI SaveImageThread(void* param);
 DWORD WINAPI SumThread(void* param);
+
+extern int CreatePipeServer();
 
 /* Hash tables */
 typedef struct htab_entry {

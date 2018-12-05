@@ -513,6 +513,11 @@ void PrintStatusInfo(BOOL info, BOOL debug, unsigned int duration, int msg_id, .
 	va_start(args, msg_id);
 	safe_vsnprintf(msg_cur, MSG_LEN, format, args);
 	va_end(args);
+
+	fprintf(stdout, msg_cur);
+	fprintf(stdout, "\n");
+	fflush(stdout);
+
 	msg_cur[MSG_LEN-1] = '\0';
 
 	if ((duration != 0) || (!bStatusTimerArmed))
